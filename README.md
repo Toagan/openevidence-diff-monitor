@@ -47,6 +47,41 @@ python3 regdiff.py check --format json --output report.json
 python3 regdiff.py check --diff --format both --output report.md
 ```
 
+## API Mode (FastAPI)
+
+Run locally:
+
+```bash
+pip install -r requirements.txt
+uvicorn app:app --reload --port 8000
+```
+
+Endpoints:
+
+- `GET /health`
+- `GET /watchlist`
+- `POST /watchlist/add`
+- `POST /watchlist/remove`
+- `POST /check`
+
+Example request:
+
+```bash
+curl -X POST http://localhost:8000/check \\
+  -H "Content-Type: application/json" \\
+  -d '{\"company_ids\":[12345],\"diff\":true,\"include_markdown\":true}'
+```
+
+## Railway Deploy
+
+1. Create a new Railway project from the GitHub repo.
+2. Set env var `FINANCIALREPORTS_API_KEY`.
+3. Railway will use the `Procfile` start command:
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port $PORT
+```
+
 ## Output
 
 The Markdown report includes a section per company and lists new filings by ID, release time, type, and title. When `--diff` is enabled, it adds section-aware diffs with an impact score. JSON output includes the same data under `results`.
