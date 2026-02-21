@@ -51,6 +51,21 @@ def health():
     return {"status": "ok", "service": "openevidence-diff", "time": regdiff._now_iso()}
 
 
+@app.get("/")
+def root():
+    return {
+        "service": "openevidence-diff",
+        "status": "ok",
+        "docs": "Use /docs for interactive API docs.",
+        "endpoints": ["/health", "/watchlist", "/watchlist/add", "/watchlist/remove", "/check"],
+    }
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return {}
+
+
 @app.get("/watchlist")
 def get_watchlist():
     state = regdiff._load_state(_state_path())
