@@ -10,6 +10,7 @@ MVP features:
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -20,6 +21,47 @@ DEFAULT_BASE_URL = "https://api.financialreports.eu"
 API_KEY_ENV = "FINANCIALREPORTS_API_KEY"
 DEFAULT_USER_AGENT = "RegDiffCLI/0.1"
 DEFAULT_STATE_PATH = os.path.expanduser("~/.openevidence-diff/state.json")
+
+PRIORITY_SECTION_RULES = [
+    ("Risk Factors", ["risk factor", "risk factors", "risks"]),
+    ("Management Discussion", ["management discussion", "management's discussion", "md&a", "management commentary", "operating review"]),
+    ("Liquidity", ["liquidity", "capital resources", "cash flow", "cash flows"]),
+    ("Going Concern", ["going concern"]),
+    ("Outlook", ["outlook", "guidance", "forward-looking", "forward looking"]),
+]
+
+KEYWORD_WEIGHTS = {
+    "going concern": 6,
+    "material weakness": 5,
+    "restatement": 5,
+    "bankrupt": 6,
+    "insolv": 5,
+    "covenant": 4,
+    "default": 4,
+    "impairment": 4,
+    "investigation": 4,
+    "litigation": 4,
+    "sanction": 4,
+    "fraud": 5,
+    "whistleblower": 4,
+    "regulatory": 3,
+    "liquidity": 3,
+    "refinanc": 3,
+    "debt": 2,
+    "restructur": 3,
+    "write-down": 4,
+    "write off": 4,
+    "guidance": 2,
+    "outlook": 2,
+    "headwind": 2,
+    "downturn": 2,
+}
+
+SENSITIVITY_PRESETS = {
+    "aggressive": {"min_len": 10, "high": 8, "medium": 4, "max_lines": 8},
+    "balanced": {"min_len": 20, "high": 12, "medium": 6, "max_lines": 6},
+    "conservative": {"min_len": 30, "high": 16, "medium": 8, "max_lines": 4},
+}
 
 
 class ApiError(Exception):
@@ -63,11 +105,17 @@ def _get_first(payload, keys, default=""):
 
 def _load_state(path):
     if not os.path.exists(path):
-        return {"watchlist": {}, "seen_filings": {}, "last_run": None}
+        return {
+            "watchlist": {},
+            "seen_filings": {},
+            "last_filing_id": {},
+            "last_run": None,
+        }
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     data.setdefault("watchlist", {})
     data.setdefault("seen_filings", {})
+    data.setdefault("last_filing_id", {})
     data.setdefault("last_run", None)
     return data
 
@@ -148,6 +196,9 @@ class FinancialReportsClient:
             query["ordering"] = ordering
         return self._request("GET", "/filings/", query=query)
 
+    def get_filing_markdown(self, filing_id):
+        return self._request("GET", f"/filings/{int(filing_id)}/markdown/")
+
 
 def _require_api_key():
     api_key = os.getenv(API_KEY_ENV)
@@ -200,6 +251,153 @@ def _format_filing(item):
     }
 
 
+def _parse_datetime(value):
+    if not value:
+        return None
+    text = str(value).replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _sort_filings_by_release(filings):
+    def key(item):
+        dt = _parse_datetime(item.get("release_datetime"))
+        if dt is None:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        return dt
+
+    return sorted(filings, key=key)
+
+
+def _normalize_heading(text):
+    cleaned = text.lower().strip()
+    cleaned = re.sub(r"[^a-z0-9\s&/\-]+", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
+
+def _map_section(heading):
+    normalized = _normalize_heading(heading)
+    for canonical, keywords in PRIORITY_SECTION_RULES:
+        for keyword in keywords:
+            if keyword in normalized:
+                return canonical
+    return None
+
+
+def _parse_markdown_sections(markdown_text):
+    sections = {}
+    current = None
+    for line in markdown_text.splitlines():
+        match = re.match(r"^(#{1,6})\s+(.*)$", line.strip())
+        if match:
+            heading = match.group(2).strip()
+            mapped = _map_section(heading)
+            current = mapped
+            if current:
+                sections.setdefault(current, [])
+            continue
+        if current:
+            sections[current].append(line)
+    output = {}
+    for key, lines in sections.items():
+        content = "\n".join(lines).strip()
+        if content:
+            output[key] = content
+    return output
+
+
+def _split_statements(text, min_len):
+    statements = []
+    seen = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[-*+\d+.()]+\s+", "", line)
+        line = re.sub(r"\s+", " ", line)
+        parts = re.split(r"(?<=[.!?])\s+", line)
+        for part in parts:
+            part = part.strip()
+            if len(part) < min_len:
+                continue
+            if part in seen:
+                continue
+            seen.add(part)
+            statements.append(part)
+    return statements
+
+
+def _score_statements(statements):
+    score = 0
+    keyword_hits = {}
+    for stmt in statements:
+        lower = stmt.lower()
+        for keyword, weight in KEYWORD_WEIGHTS.items():
+            if keyword in lower:
+                score += weight
+                keyword_hits[keyword] = keyword_hits.get(keyword, 0) + 1
+    return score, keyword_hits
+
+
+def _diff_section(old_text, new_text, min_len, max_lines):
+    old_statements = _split_statements(old_text, min_len)
+    new_statements = _split_statements(new_text, min_len)
+    old_set = set(old_statements)
+    new_set = set(new_statements)
+    added = [stmt for stmt in new_statements if stmt not in old_set]
+    removed = [stmt for stmt in old_statements if stmt not in new_set]
+
+    keyword_score, keyword_hits = _score_statements(added + removed)
+    score = len(added) + len(removed) + keyword_score
+
+    return {
+        "added": added[:max_lines],
+        "removed": removed[:max_lines],
+        "added_count": len(added),
+        "removed_count": len(removed),
+        "score": score,
+        "keyword_hits": keyword_hits,
+    }
+
+
+def _impact_label(score, thresholds):
+    if score >= thresholds["high"]:
+        return "HIGH"
+    if score >= thresholds["medium"]:
+        return "MEDIUM"
+    if score > 0:
+        return "LOW"
+    return "NONE"
+
+
+def _compute_section_diffs(old_sections, new_sections, sensitivity):
+    diffs = []
+    min_len = sensitivity["min_len"]
+    max_lines = sensitivity["max_lines"]
+    for canonical, _keywords in PRIORITY_SECTION_RULES:
+        old_text = old_sections.get(canonical, "")
+        new_text = new_sections.get(canonical, "")
+        if not old_text and not new_text:
+            continue
+        diff = _diff_section(old_text, new_text, min_len, max_lines)
+        if diff["added_count"] == 0 and diff["removed_count"] == 0:
+            continue
+        diff["section"] = canonical
+        diffs.append(diff)
+    return diffs
+
+
+def _get_markdown_cached(cache, client, filing_id):
+    if filing_id in cache:
+        return cache[filing_id]
+    markdown = client.get_filing_markdown(filing_id)
+    cache[filing_id] = markdown
+    return markdown
+
+
 def _render_markdown_report(results, generated_at):
     lines = ["# OpenEvidence Diff Report", f"Generated: {generated_at}", ""]
     if not results:
@@ -225,6 +423,48 @@ def _render_markdown_report(results, generated_at):
                 lines.append(f"- [{fid}] {released} | {ftype} | {title}")
         else:
             lines.append("New filings: 0")
+
+        diffs = entry.get("diffs", [])
+        if diffs:
+            lines.append("Section-aware diff summary:")
+            for diff in diffs:
+                filing_id = diff.get("filing_id")
+                baseline_id = diff.get("baseline_id")
+                impact = diff.get("impact_level")
+                score = diff.get("impact_score")
+                note = diff.get("note")
+                if baseline_id:
+                    lines.append(
+                        f"Filing {filing_id} vs {baseline_id} | Impact: {impact} (score {score})"
+                    )
+                else:
+                    lines.append(
+                        f"Filing {filing_id} | Impact: {impact} (score {score})"
+                    )
+                if note:
+                    lines.append(note)
+                section_diffs = diff.get("section_diffs", [])
+                if not section_diffs:
+                    lines.append("No material section changes detected.")
+                    continue
+                for section in section_diffs:
+                    section_name = section.get("section")
+                    section_score = section.get("score")
+                    added_count = section.get("added_count")
+                    removed_count = section.get("removed_count")
+                    lines.append(
+                        f"Section: {section_name} (score {section_score}, +{added_count} / -{removed_count})"
+                    )
+                    added = section.get("added", [])
+                    removed = section.get("removed", [])
+                    if added:
+                        lines.append("Added:")
+                        for stmt in added:
+                            lines.append(f"- {stmt}")
+                    if removed:
+                        lines.append("Removed:")
+                        for stmt in removed:
+                            lines.append(f"- {stmt}")
         lines.append("")
 
     if not any_new:
@@ -281,7 +521,7 @@ def build_parser():
     )
     check.add_argument(
         "--format",
-        choices=["markdown", "json"],
+        choices=["markdown", "json", "both"],
         default="markdown",
         help="Output format",
     )
@@ -290,9 +530,29 @@ def build_parser():
         help="Write report to file instead of stdout",
     )
     check.add_argument(
+        "--json-output",
+        help="Write JSON report to file when format is both",
+    )
+    check.add_argument(
         "--no-save",
         action="store_true",
         help="Do not persist state changes",
+    )
+    check.add_argument(
+        "--diff",
+        action="store_true",
+        help="Fetch filing markdown and compute section-aware diffs",
+    )
+    check.add_argument(
+        "--sensitivity",
+        choices=["aggressive", "balanced", "conservative"],
+        default="aggressive",
+        help="Sensitivity for materiality scoring (default: aggressive)",
+    )
+    check.add_argument(
+        "--max-lines",
+        type=int,
+        help="Max statements to show per added/removed list",
     )
 
     return parser
@@ -354,6 +614,11 @@ def main(argv=None):
                 print("Watchlist is empty. Add companies with 'watch add'.")
                 return 0
 
+            sensitivity = dict(SENSITIVITY_PRESETS[args.sensitivity])
+            if args.max_lines is not None:
+                sensitivity["max_lines"] = args.max_lines
+
+            markdown_cache = {} if args.diff else None
             results = []
             for company_id, meta in watchlist.items():
                 data = client.list_filings(
@@ -364,6 +629,7 @@ def main(argv=None):
                 items, _ = _extract_results(data)
                 seen = state.get("seen_filings", {}).get(company_id, {})
                 new_filings = []
+                formatted_items = []
                 for item in items:
                     formatted = _format_filing(item)
                     fid = formatted.get("id")
@@ -373,7 +639,62 @@ def main(argv=None):
                     if fid_key not in seen:
                         new_filings.append(formatted)
                     seen[fid_key] = formatted
+                    formatted_items.append(formatted)
                 state.setdefault("seen_filings", {})[company_id] = seen
+
+                diffs = []
+                if args.diff and new_filings:
+                    baseline_id = state.get("last_filing_id", {}).get(company_id)
+                    if baseline_id is None and len(formatted_items) > 1:
+                        baseline_id = formatted_items[1].get("id")
+
+                    sorted_new = _sort_filings_by_release(new_filings)
+                    current_baseline = baseline_id
+                    for filing in sorted_new:
+                        filing_id = filing.get("id")
+                        diff_entry = {
+                            "filing_id": filing_id,
+                            "baseline_id": current_baseline,
+                            "impact_score": 0,
+                            "impact_level": "NONE",
+                            "section_diffs": [],
+                        }
+
+                        if current_baseline is None:
+                            diff_entry["note"] = "No baseline filing available for diff."
+                            diffs.append(diff_entry)
+                            current_baseline = filing_id
+                            continue
+
+                        try:
+                            old_md = _get_markdown_cached(
+                                markdown_cache, client, current_baseline
+                            )
+                            new_md = _get_markdown_cached(
+                                markdown_cache, client, filing_id
+                            )
+                            old_sections = _parse_markdown_sections(old_md)
+                            new_sections = _parse_markdown_sections(new_md)
+                            section_diffs = _compute_section_diffs(
+                                old_sections, new_sections, sensitivity
+                            )
+                            impact_score = sum(
+                                section.get("score", 0) for section in section_diffs
+                            )
+                            diff_entry["section_diffs"] = section_diffs
+                            diff_entry["impact_score"] = impact_score
+                            diff_entry["impact_level"] = _impact_label(
+                                impact_score, sensitivity
+                            )
+                        except ApiError as exc:
+                            diff_entry["note"] = f"Diff unavailable: {exc}"
+
+                        diffs.append(diff_entry)
+                        current_baseline = filing_id
+
+                latest_id = formatted_items[0].get("id") if formatted_items else None
+                if latest_id is not None:
+                    state.setdefault("last_filing_id", {})[company_id] = latest_id
 
                 results.append(
                     {
@@ -381,6 +702,7 @@ def main(argv=None):
                         "label": meta.get("label") or "",
                         "new_filings": new_filings,
                         "total_checked": len(items),
+                        "diffs": diffs,
                     }
                 )
 
@@ -389,16 +711,43 @@ def main(argv=None):
                 state["last_run"] = generated_at
                 _save_state(args.state, state)
 
-            if args.format == "json":
-                output = _json_dumps({"generated_at": generated_at, "results": results})
-            else:
-                output = _render_markdown_report(results, generated_at)
+            payload = {"generated_at": generated_at, "results": results}
+            markdown_output = _render_markdown_report(results, generated_at)
+            json_output = _json_dumps(payload)
 
-            if args.output:
-                with open(args.output, "w", encoding="utf-8") as handle:
-                    handle.write(output)
-            else:
-                print(output)
+            if args.format == "json":
+                output = json_output
+                if args.output:
+                    with open(args.output, "w", encoding="utf-8") as handle:
+                        handle.write(output)
+                else:
+                    print(output)
+                return 0
+
+            if args.format == "markdown":
+                if args.output:
+                    with open(args.output, "w", encoding="utf-8") as handle:
+                        handle.write(markdown_output)
+                else:
+                    print(markdown_output)
+                return 0
+
+            if args.format == "both":
+                if args.output:
+                    with open(args.output, "w", encoding="utf-8") as handle:
+                        handle.write(markdown_output)
+                else:
+                    print(markdown_output)
+
+                json_path = args.json_output
+                if not json_path and args.output:
+                    json_path = f"{args.output}.json"
+                if json_path:
+                    with open(json_path, "w", encoding="utf-8") as handle:
+                        handle.write(json_output)
+                elif not args.output:
+                    print("\nJSON:")
+                    print(json_output)
             return 0
 
     except ApiError as exc:

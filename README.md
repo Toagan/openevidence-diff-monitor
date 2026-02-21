@@ -6,7 +6,8 @@ CLI that tracks new filings for a watchlist of companies using the FinancialRepo
 
 - Watchlist management
 - Check for new filings since last run
-- Markdown or JSON digest output
+- Section-aware diffs with materiality scoring (optional)
+- Markdown or JSON digest output (or both)
 
 ## Setup
 
@@ -43,13 +44,16 @@ Check for new filings:
 ```bash
 python3 regdiff.py check --limit 5
 python3 regdiff.py check --format json --output report.json
+python3 regdiff.py check --diff --format both --output report.md
 ```
 
 ## Output
 
-The Markdown report includes a section per company and lists new filings by ID, release time, type, and title. JSON output includes the same data under `results`.
+The Markdown report includes a section per company and lists new filings by ID, release time, type, and title. When `--diff` is enabled, it adds section-aware diffs with an impact score. JSON output includes the same data under `results`.
 
 ## Notes
 
 - State is stored in `~/.openevidence-diff/state.json` by default.
 - This CLI only detects *new* filings since the last run (based on filing IDs).
+ - Use `--sensitivity aggressive|balanced|conservative` to tune scoring.
+ - Use `--json-output` with `--format both` to control JSON output path.
